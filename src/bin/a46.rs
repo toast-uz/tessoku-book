@@ -8,7 +8,7 @@ use xorshift_rand::*;
 use kyopro_args::*;
 
 const LIMIT: f64 = 0.99;
-const DEBUG: bool = false;
+const DEBUG: bool = true;
 const SA_PATIENCE: usize = 500;
 
 #[allow(unused_macros)]
@@ -140,10 +140,11 @@ impl Agent {
     fn select_neighbor(&self, e: &Env, rng: &mut XorshiftRng, kick: bool) -> Neighbor {
         if !kick {
             let mut candidate = Vec::new();
-            // 2-opt が有効かどうかを判定する
             let mut i_list = (0..(e.n - 2)).collect_vec();
             i_list.shuffle(rng);
             for &i in &i_list {
+                // 2-opt が有効かどうかを高速に判定する
+                // https://future-architect.github.io/articles/20211201a/#2-opt-ILS
                 let (v1, v2) = (self.seq[i], self.seq[i + 1]);
                 for &u in &e.shorters[v1][v2] {
                     let j = self.inv_seq[u];
