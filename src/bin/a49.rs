@@ -8,7 +8,7 @@ use fixedbitset::FixedBitSet;
 
 const N: usize = 20;
 const M: usize = 3;
-const MAX_BEAM_WIDTH: usize = 10000;
+const MAX_BEAM_WIDTH: usize = 30000;
 const CHOKUDAI_WIDTH: usize = 1000;
 
 //const LIMIT: f64 = 0.8; // 大量メモリの解放に時間がかかるので、余裕を持たせる
