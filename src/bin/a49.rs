@@ -2,14 +2,16 @@ use std::time::Instant;
 use proconio::input;
 use proconio::marker::Usize1;
 use itertools::Itertools;
-use xorshift_rand::*;
+use heapmap::*;
+use fixedbitset::FixedBitSet;
 //use rustc_hash::FxHashMap as HashMap;
 
 const N: usize = 20;
 const M: usize = 3;
 const MAX_BEAM_WIDTH: usize = 10000;
+const CHOKUDAI_WIDTH: usize = 1000;
 
-const LIMIT: f64 = 0.0;
+//const LIMIT: f64 = 0.8; // 大量メモリの解放に時間がかかるので、余裕を持たせる
 const DEBUG: bool = true;
 
 #[allow(unused_macros)]
@@ -21,12 +23,12 @@ macro_rules! dbg2 {( $( $x:expr ),* ) => ( if DEBUG {
 }) }
 
 fn main() {
-    let timer = Instant::now();
-    let mut rng = xorshift_rand::xorshift_rng();
+    //let timer = Instant::now();
     let e = Env::new();
     let mut a = Agent::new(&e);
-    a.beam_search(&e, &mut rng, &timer, LIMIT);
-    println!("{}", a.result());
+    //a.chokudai_search(&e, &timer, LIMIT);
+    a.beam_search(&e);
+    println!("{}", a.result(&e));
     dbg!("counter = {}", a.counter);
     dbg!("Computed_score = {}", a.score);
 }
@@ -58,7 +60,7 @@ impl Env {
 
 #[derive(Debug, Clone, Default)]
 struct Agent {
-    ans: Vec<bool>,
+    ans: FixedBitSet,
     score: isize,
     counter: usize,
 }
@@ -66,9 +68,10 @@ struct Agent {
 impl Agent {
     fn new(_e: &Env) -> Self { Self::default() }
 
-    fn beam_search(&mut self, e: &Env, _rng: &mut XorshiftRng, _timer: &Instant, _limit: f64) {
+    #[allow(dead_code)]
+    fn beam_search(&mut self, e: &Env) {
         // 初期状態を登録
-        let mut todo = vec![State::default()];
+        let mut todo = vec![State::default(e)];
         // ビームサーチ
         for t in 0..e.t {
             let mut next_todo = Vec::new();
@@ -80,9 +83,8 @@ impl Agent {
                 for next_state in state.neighbors(e, t) {
                     // 枝刈り
                     if max_score < next_state.score {
-                        dbg!("#{}, new max score from:{} to:{}", t, state.score, next_state.score);
                         max_score = next_state.score;
-                    } else if max_score - next_state.score >= M as isize {
+                    } else if next_state.score <= max_score - 3 {
                         continue;
                     }
                     // 処理候補に登録
@@ -92,10 +94,6 @@ impl Agent {
             }
             // 処理候補をスコアが大きい順にソートして、ビーム幅分だけ残す
             next_todo.sort_by_key(|state| -state.score);
-            dbg!("#{}, next_todo size:{} score 1st:{} beam_last:{} last:{}",
-                t, next_todo.len(), next_todo[0].score,
-                next_todo[MAX_BEAM_WIDTH.min(next_todo.len()) - 1].score,
-                next_todo[next_todo.len() - 1].score);
             next_todo.truncate(MAX_BEAM_WIDTH);
             todo = next_todo;   // reverseしない　->　popはスコアが小さい順に取り出す
         }
@@ -103,23 +101,51 @@ impl Agent {
         self.score = todo[0].score;
     }
 
+    #[allow(dead_code)]
+    fn chokudai_search(&mut self, e: &Env, timer: &Instant, limit: f64) {
+        // 初期状態を登録
+        let mut todo = vec![HeapMap::new(false); e.t + 1];
+        todo[0].push((0, State::default(e)));
+        // chokudaiサーチ
+        'outer: loop { for t in 0..e.t { for _ in 0..CHOKUDAI_WIDTH {
+            if timer.elapsed().as_secs_f64() > limit { break 'outer; }
+            // 現在の状態を順番に取り出す
+            let Some((_, state)) = todo[t].pop() else { continue; };
+            // 次の状態を列挙
+            for next_state in state.neighbors(e, t) {
+                // 処理候補に登録
+                self.counter += 1;
+                todo[t + 1].push((next_state.score, next_state));
+            }
+        } } }
+        let goal = todo[e.t].pop().unwrap().1;
+        self.ans = goal.ans.clone();
+        self.score = goal.score;
+    }
+
     // 結果出力
-    fn result(&self) -> String {
-        self.ans.iter().map(|&b| if b { "A" } else { "B" }).join("\n")
+    fn result(&self, e: &Env) -> String {
+        (0..e.t).map(|t| if self.ans[t] { "A" } else { "B" }).join("\n")
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct State {
     list: Vec<isize>,
-    ans: Vec<bool>,
+    ans: FixedBitSet,
     score: isize,
     score_diff: isize,
 }
 
 impl State {
-    fn new(list: Vec<isize>, ans: Vec<bool>, score: isize, score_diff: isize) -> Self {
+    fn new(list: Vec<isize>, ans: FixedBitSet, score: isize, score_diff: isize) -> Self {
         Self { list, ans, score, score_diff }
+    }
+
+    fn default(e: &Env) -> Self {
+        let mut ans = FixedBitSet::with_capacity(e.t);
+        ans.clear();
+        Self::new(vec![0; N], ans, 0, N as isize)
     }
 
     fn neighbors(&self, e: &Env, t: usize) -> Vec<Self> {
@@ -133,122 +159,77 @@ impl State {
                 .iter().filter(|&&x| list[x] == 0).count() as isize;
             let score = self.score + score_diff;
             let mut ans = self.ans.clone();
-            ans.push(d == 1);
+            if d == 1 { ans.insert(t); }
             res.push(State::new(list, ans, score, score_diff));
         }
         res
     }
 }
 
-impl Default for State {
-    fn default() -> Self {
-        Self::new(vec![0; N], vec![], 0, N as isize)
-    }
-}
-
-
-mod xorshift_rand {
+mod heapmap {
     #![allow(dead_code)]
-    use std::time::SystemTime;
-    use rustc_hash::FxHashSet as HashSet;
 
-    pub fn xorshift_rng() -> XorshiftRng {
-        let seed = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap().as_secs() as u64;
-        let mut rng = XorshiftRng::from_seed(seed);
-        for _ in 0..100 { rng._xorshift(); }    // 初期値が偏らないようにウォーミングアップ
-        rng
+    use std::collections::BinaryHeap;
+    use rustc_hash::FxHashMap as HashMap;
+    use std::cmp::Reverse;
+
+    #[derive(Debug, Clone)]
+    pub struct HeapMap<K: Ord, V> {
+        pq: PriorityQueue<K>,
+        map: HashMap<usize, V>,
+        counter: usize,
     }
-    pub struct XorshiftRng { seed: u64, }
 
-    impl XorshiftRng {
-        pub fn from_seed(seed: u64) -> Self { Self { seed, } }
-        fn _xorshift(&mut self) {
-            self.seed ^= self.seed << 3;
-            self.seed ^= self.seed >> 35;
-            self.seed ^= self.seed << 14;
+    impl<K: Ord, V> HeapMap<K, V> {
+        pub fn new(priority_min: bool) -> Self {
+            Self { pq: PriorityQueue::new(priority_min), map: HashMap::default(), counter: 0, }
         }
-        // [low, high) の範囲のusizeの乱数を求める
-        pub fn gen_range<R: std::ops::RangeBounds<usize>>(&mut self, range: R) -> usize {
-            let (start, end) = Self::unsafe_decode_range_(&range);
-            assert!(start < end);
-            self._xorshift();
-            (start as u64 + self.seed % (end - start) as u64) as usize
+        pub fn len(&self) -> usize { self.pq.len() }
+        pub fn is_empty(&self) -> bool { self.pq.is_empty() }
+        pub fn push(&mut self, (key, value): (K, V)) {
+            self.pq.push((key, self.counter));
+            self.map.insert(self.counter, value);
+            self.counter += 1;  // unsafe
         }
-        // 重み付きで乱数を求める
-        pub fn gen_range_weighted<R: std::ops::RangeBounds<usize>>(&mut self, range: R, weights: &[usize]) -> usize {
-            let (start, end) = Self::unsafe_decode_range_(&range);
-            assert_eq!(end - start, weights.len());
-            let sum = weights.iter().sum::<usize>();
-            let x = self.gen_range(0..sum);
-            let mut acc = 0;
-            for i in 0..weights.len() {
-                acc += weights[i];
-                if acc > x { return i; }
+        pub fn pop(&mut self) -> Option<(K, V)> {
+            let (key, counter) = self.pq.pop()?;
+            let value = self.map.remove(&counter)?;
+            Some((key, value))
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    enum PriorityQueue<K> {
+        Max(BinaryHeap<(K, usize)>),
+        Min(BinaryHeap<(Reverse<K>, usize)>),
+    }
+
+    impl<K: Ord> PriorityQueue<K> {
+        fn new(priority_min: bool) -> Self {
+            if priority_min { Self::Min(BinaryHeap::new()) } else { Self::Max(BinaryHeap::new()) }
+        }
+        fn len(&self) -> usize {
+            match self {
+                Self::Max(pq) => pq.len(),
+                Self::Min(pq) => pq.len(),
             }
-            unreachable!()
         }
-        // [low, high) の範囲から重複なくm個のusizeの乱数を求める
-        pub fn gen_range_multiple<R: std::ops::RangeBounds<usize>>(&mut self, range: R, m: usize) -> Vec<usize> {
-            let (start, end) = Self::unsafe_decode_range_(&range);
-            assert!(m <= end - start);
-            let many = m > (end - start) / 2; // mが半分より大きいか
-            let n = if many { end - start - m } else { m };
-            let mut res = HashSet::default();
-            while res.len() < n {   // 半分より小さい方の数をランダムに選ぶ
-                self._xorshift();
-                let x = (start as u64 + self.seed % (end - start) as u64) as usize;
-                res.insert(x);
+        fn is_empty(&self) -> bool {
+            match self {
+                Self::Max(pq) => pq.is_empty(),
+                Self::Min(pq) => pq.is_empty(),
             }
-            (start..end).filter(|&x| many ^ res.contains(&x)).collect()
         }
-        // rangeをもとに半開区間の範囲[start, end)を求める
-        fn unsafe_decode_range_<R: std::ops::RangeBounds<usize>>(range: &R) -> (usize, usize) {
-            let std::ops::Bound::Included(&start) = range.start_bound() else { panic!(); };
-            let end = match range.end_bound() {
-                std::ops::Bound::Included(&x) => x + 1,
-                std::ops::Bound::Excluded(&x) => x,
-                _ => panic!(),
-            };
-            (start, end)
+        fn push(&mut self, (key, counter): (K, usize)) {
+            match self {
+                Self::Max(pq) => pq.push((key, counter)),
+                Self::Min(pq) => pq.push((Reverse(key), counter)),
+            }
         }
-        // [0, 1] の範囲のf64の乱数を求める
-        pub fn gen(&mut self) -> f64 {
-            self._xorshift();
-            self.seed as f64 / u64::MAX as f64
-        }
-        // u64の乱数を求める
-        pub fn gen_u64(&mut self) -> u64 {
-            self._xorshift();
-            self.seed
-        }
-    }
-
-    pub trait SliceXorshiftRandom<T> {
-        fn choose(&self, rng: &mut XorshiftRng) -> T;
-        fn choose_multiple(&self, rng: &mut XorshiftRng, m: usize) -> Vec<T>;
-        fn choose_weighted(&self, rng: &mut XorshiftRng, weights: &[usize]) -> T;
-        fn shuffle(&mut self, rng: &mut XorshiftRng);
-    }
-
-    impl<T: Clone> SliceXorshiftRandom<T> for [T] {
-        fn choose(&self, rng: &mut XorshiftRng) -> T {
-            let x = rng.gen_range(0..self.len());
-            self[x].clone()
-        }
-        fn choose_weighted(&self, rng: &mut XorshiftRng, weights: &[usize]) -> T {
-            let x = rng.gen_range_weighted(0..self.len(), weights);
-            self[x].clone()
-        }
-        fn choose_multiple(&self, rng: &mut XorshiftRng, m: usize) -> Vec<T> {
-            let selected = rng.gen_range_multiple(0..self.len(), m);
-            selected.iter().map(|&i| self[i].clone()).collect()
-        }
-        fn shuffle(&mut self, rng: &mut XorshiftRng) {
-            // Fisher-Yates shuffle
-            for i in (1..self.len()).rev() {
-                let x = rng.gen_range(0..=i);
-                self.swap(i, x);
+        fn pop(&mut self) -> Option<(K, usize)> {
+            match self {
+                Self::Max(pq) => pq.pop(),
+                Self::Min(pq) => pq.pop().map(|(Reverse(key), counter)| (key, counter)),
             }
         }
     }
