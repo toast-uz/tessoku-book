@@ -1,15 +1,14 @@
-use std::time::Instant;
+use std::cmp::Reverse;
 use proconio::input;
 use proconio::marker::Usize1;
 use itertools::Itertools;
-use heapmap::*;
-use fixedbitset::FixedBitSet;
-//use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::FxHashSet as HashSet;
 
 const N: usize = 20;
 const M: usize = 3;
-const MAX_BEAM_WIDTH: usize = 30000;
-const CHOKUDAI_WIDTH: usize = 1000;
+const T: usize = 100;
+const MAX_BEAM_DEPTH: usize = T;
+const MAX_BEAM_WIDTH: usize = 20000;
 
 //const LIMIT: f64 = 0.8; // 大量メモリの解放に時間がかかるので、余裕を持たせる
 const DEBUG: bool = true;
@@ -23,214 +22,268 @@ macro_rules! dbg2 {( $( $x:expr ),* ) => ( if DEBUG {
 }) }
 
 fn main() {
-    //let timer = Instant::now();
     let e = Env::new();
     let mut a = Agent::new(&e);
-    //a.chokudai_search(&e, &timer, LIMIT);
-    a.beam_search(&e);
+    a.optimize(&e);
     println!("{}", a.result(&e));
-    dbg!("counter = {}", a.counter);
-    dbg!("Computed_score = {}", a.score);
+    dbg!("Counter = {}, memory = {} (valid: {})", a.counter, a.nodes.len(), a.nodes.len() - a.free_nodes.len());
+    dbg!("Computed_score = {}", a.compute_score());
 }
 
 #[derive(Debug, Clone, Default)]
 struct Env {
-    t: usize,
+    root_state: State,
     pqr: Vec<Vec<usize>>,
 }
 
 impl Env {
     fn new() -> Self {
         input! {
-            t: usize,
-            pqr: [[Usize1; M]; t],
+            _t: usize,
+            pqr: [[Usize1; M]; T],
         }
         let mut e = Self::default();
-        e.init(t, &pqr); e
+        e.init(&pqr); e
     }
 
     // テストが作りやすいように、newとinitを分離
-    fn init(&mut self, t: usize, pqr: &[Vec<usize>]) {
+    fn init(&mut self, pqr: &[Vec<usize>]) {
         // 問題入力の設定
-        self.t = t;
         self.pqr = pqr.to_vec();
+        self.root_state = State::new();
         // ハイパーパラメータの設定
     }
 }
 
+// 木dp
+// 遷移がdp[i]からdp[i+1]へ限定される場合
+
 #[derive(Debug, Clone, Default)]
 struct Agent {
-    ans: FixedBitSet,
-    score: isize,
+    state: State,
+    node_id: usize,
+    nodes: Vec<Node>,
+    free_nodes: Vec<usize>, // 使われていないノードのindex
     counter: usize,
 }
 
 impl Agent {
-    fn new(_e: &Env) -> Self { Self::default() }
-
-    #[allow(dead_code)]
-    fn beam_search(&mut self, e: &Env) {
-        // 初期状態を登録
-        let mut todo = vec![State::default(e)];
-        // ビームサーチ
-        for t in 0..e.t {
-            let mut next_todo = Vec::new();
-            // 枝刈りのための準備
-            let mut max_score = 0;
-            // 現在の状態を順番に取り出す
-            while let Some(state) = todo.pop() {
-                // 次の状態を列挙
-                for next_state in state.neighbors(e, t) {
-                    // 枝刈り
-                    if max_score < next_state.score {
-                        max_score = next_state.score;
-                    } else if next_state.score <= max_score - 3 {
-                        continue;
-                    }
-                    // 処理候補に登録
-                    self.counter += 1;
-                    next_todo.push(next_state);
+    fn new(e: &Env) -> Self {
+        let root_node = Node::new(Op::default());
+        Self {
+            state: e.root_state.clone(),
+            node_id: 0,
+            nodes: vec![root_node],
+            free_nodes: Vec::new(),
+            ..Self::default()
+        }
+    }
+    // ビームサーチで探索
+    fn optimize(&mut self, e: &Env) {
+        for depth in 0..MAX_BEAM_DEPTH {
+            let max_beam_width = if depth < MAX_BEAM_DEPTH - 1 { MAX_BEAM_WIDTH } else { 1 };
+            self.move_root(e);
+            for cand in self.emum_cands(e, depth)
+                    .into_iter().sorted_unstable_by_key(|cand| Reverse(cand.score))
+                    .take(max_beam_width) {
+                self.push_child(cand);
+                self.counter += 1;
+            }
+            self.prune(depth);
+        }
+        // ベストノードを登録
+        self.node_id = (0..self.nodes.len())
+            .filter(|&id| self.nodes[id].goal)
+            .max_by_key(|&id| self.nodes[id].score).unwrap();
+    }
+    // dp復元
+    fn restore(&self, mut node_id: usize) -> Vec<Op> {
+        let mut res = Vec::new();
+        while node_id != !0 {
+            res.push(self.nodes[node_id].op.clone());
+            node_id = self.nodes[node_id].parent;
+        }
+        res.pop();  // ルートノードのopは適用しない
+        res.reverse();
+        res
+    }
+    // node_idをdp復元して出力
+    fn result(&self, _e: &Env) -> String {
+        let ops = self.restore(self.node_id);
+        ops.iter().map(|op| op.to_string()).join("\n")
+    }
+    // 次の操作を列挙する
+    fn emum_cands(&self, e: &Env, depth: usize) -> Vec<Cand> {
+        let mut res = Vec::new();
+        let mut node_id = self.node_id;
+        let mut state = self.state.clone();
+        let mut seen = HashSet::from_iter([!0]);
+        loop {
+            // 深さdepthなら次のノードを候補に追加
+            if self.nodes[node_id].depth == depth {
+                res.extend(self.enum_cands_from_node(e, node_id, &state));
+            }
+            // 次のノードに移動
+            if self.nodes[node_id].depth < depth && !seen.contains(&self.nodes[node_id].child) {
+                // 深さ不十分で未到達な子供がいるなら、子供に移動
+                let parent_depth = self.nodes[node_id].depth;
+                node_id = self.nodes[node_id].child;
+                seen.insert(node_id);
+                state.apply(e, parent_depth, &self.nodes[node_id].op);
+            } else {
+                if node_id == self.node_id { break; }   // ルートノードに戻っていたら終了
+                assert_ne!(self.nodes[node_id].parent, !0, "parent_id = !0, node = {} {:?} {}", node_id, self.nodes[node_id], self.free_nodes.contains(&node_id));
+                let parent_depth = self.parent_depth(node_id);
+                state.revert(e, parent_depth, &self.nodes[node_id].op); // ステートをもとに戻す
+                if self.nodes[node_id].next != !0 {
+                    // 兄弟がいるなら兄弟に移動
+                    node_id = self.nodes[node_id].next;
+                    state.apply(e, parent_depth, &self.nodes[node_id].op);
+                } else {
+                    // 兄弟がいないなら親に移動
+                    node_id = self.nodes[node_id].parent;
                 }
             }
-            // 処理候補をスコアが大きい順にソートして、ビーム幅分だけ残す
-            next_todo.sort_by_key(|state| -state.score);
-            next_todo.truncate(MAX_BEAM_WIDTH);
-            todo = next_todo;   // reverseしない　->　popはスコアが小さい順に取り出す
         }
-        self.ans = todo[0].ans.clone();
-        self.score = todo[0].score;
+        res
     }
-
-    #[allow(dead_code)]
-    fn chokudai_search(&mut self, e: &Env, timer: &Instant, limit: f64) {
-        // 初期状態を登録
-        let mut todo = vec![HeapMap::new(false); e.t + 1];
-        todo[0].push((0, State::default(e)));
-        // chokudaiサーチ
-        'outer: loop { for t in 0..e.t { for _ in 0..CHOKUDAI_WIDTH {
-            if timer.elapsed().as_secs_f64() > limit { break 'outer; }
-            // 現在の状態を順番に取り出す
-            let Some((_, state)) = todo[t].pop() else { continue; };
-            // 次の状態を列挙
-            for next_state in state.neighbors(e, t) {
-                // 処理候補に登録
-                self.counter += 1;
-                todo[t + 1].push((next_state.score, next_state));
+    fn enum_cands_from_node(&self, e: &Env, node_id: usize, state: &State) -> Vec<Cand> {
+        let mut res = Vec::new();
+        let node = &self.nodes[node_id];
+        let pqr = &e.pqr[node.depth];
+        let score_diff_old = (0..M).filter(|&i| state.0[pqr[i]] == 0).count() as isize;
+        for op in [Op(1), Op(-1)].iter() {
+            let mut cand = Cand { op: op.clone(), depth: node.depth + 1, score: node.score, score_diff: 0, parent: node_id, goal: false };
+            let score_diff_new = (0..M).filter(|&i| state.0[pqr[i]] + op.0 == 0).count() as isize;
+            cand.score_diff = node.score_diff + score_diff_new - score_diff_old;
+            cand.score = node.score + cand.score_diff;
+            cand.goal = if cand.depth == T { true } else { false };
+            res.push(cand);
+        }
+        res
+    }
+    // ルートノードを分岐位置まで移動
+    fn move_root(&mut self, e: &Env) {
+        while self.nodes[self.node_id].child != !0 &&
+                self.nodes[self.nodes[self.node_id].child].next == !0 {
+            let parent_depth = self.nodes[self.node_id].depth;
+            self.node_id = self.nodes[self.node_id].child;
+            self.state.apply(e, parent_depth, &self.nodes[self.node_id].op);
+        }
+    }
+    // candを子供として追加し、そのノードのidを返す
+    fn push_child(&mut self, cand: Cand) -> usize {
+        let parent_node_id = cand.parent;
+        let new_node = cand.to_node();
+        // 新しいノードのidを決めて、ノードを登録する
+        let new_node_id = if let Some(free) = self.free_nodes.pop() {
+            self.nodes[free] = new_node;
+            free
+        } else {
+            self.nodes.push(new_node);
+            self.nodes.len() - 1
+        };
+        // 親ノードの子供リストの先頭に新しいノードを追加
+        if parent_node_id != !0 {
+            let next_node_id = self.nodes[parent_node_id].child;
+            self.nodes[parent_node_id].child = new_node_id;
+            if next_node_id != !0 {
+                self.nodes[next_node_id].prev = new_node_id;
+                self.nodes[new_node_id].next = next_node_id;
             }
-        } } }
-        let goal = todo[e.t].pop().unwrap().1;
-        self.ans = goal.ans.clone();
-        self.score = goal.score;
+        }
+        new_node_id
     }
+    // 不要になったノードを削除
+    // 深さdepthまでで子供がない（かつゴールしていない）ノードを再帰的に削除する
+    fn prune(&mut self, depth: usize) {
+        for node_id in 0..self.nodes.len() {
+            if self.nodes[node_id].parent == !0 || self.nodes[node_id].depth > depth { continue; }
+            self.remove_recursive(node_id);
+        }
+    }
+    fn remove_recursive(&mut self, node_id: usize) {
+        if self.nodes[node_id].child != !0 || self.nodes[node_id].goal { return; }
+        // 子供がない（かつゴールしていない）ノードを再帰的に削除
+        let parent_node_id = self.nodes[node_id].parent;
+        let prev_node_id = self.nodes[node_id].prev;
+        let next_node_id = self.nodes[node_id].next;
+        if prev_node_id != !0 { self.nodes[prev_node_id].next = next_node_id; }
+        if next_node_id != !0 { self.nodes[next_node_id].prev = prev_node_id; }
+        if parent_node_id != !0 && self.nodes[parent_node_id].child == node_id {
+            self.nodes[parent_node_id].child = next_node_id;
+            self.remove_recursive(parent_node_id);
+        }
+        //dbg!("free_nodes_id = {} parent = {}", node_id, self.nodes[node_id].parent);
+        self.nodes[node_id] = Node::new(Op::default());
+        self.free_nodes.push(node_id);
+    }
+    fn parent_depth(&self, node_id: usize) -> usize {
+        let parent_id = self.nodes[node_id].parent;
+        self.nodes[parent_id].depth
+    }
+    fn compute_score(&self) -> isize { self.nodes[self.node_id].score }
+}
 
-    // 結果出力
-    fn result(&self, e: &Env) -> String {
-        (0..e.t).map(|t| if self.ans[t] { "A" } else { "B" }).join("\n")
+#[derive(Debug, Clone, Default)]
+struct State(Vec<isize>);
+impl State {
+    fn new() -> Self { Self { 0: vec![0; N] } }
+    fn apply(&mut self, e: &Env, parent_depth: usize, op: &Op) {
+        let pqr = &e.pqr[parent_depth];
+        self.0[pqr[0]] += op.0;
+        self.0[pqr[1]] += op.0;
+        self.0[pqr[2]] += op.0;
+    }
+    fn revert(&mut self, e: &Env, parent_depth: usize, op: &Op) {
+        let pqr = &e.pqr[parent_depth];
+        self.0[pqr[0]] -= op.0;
+        self.0[pqr[1]] -= op.0;
+        self.0[pqr[2]] -= op.0;
     }
 }
 
 #[derive(Debug, Clone, Default)]
-struct State {
-    list: Vec<isize>,
-    ans: FixedBitSet,
+struct Cand {
+    op: Op,  // 親からの差分オペレーション
+    depth: usize,
+    score_diff: isize,
+    score: isize,
+    parent: usize,
+    goal: bool,
+}
+impl Cand {
+    fn to_node(&self) -> Node { Node {
+        op: self.op.clone(), depth: self.depth, goal: self.goal,
+        score: self.score, score_diff: self.score_diff,
+        parent: self.parent, child: !0, prev: !0, next: !0,
+    } }
+}
+
+#[derive(Debug, Clone, Default)]
+struct Node {
+    op: Op,  // 親からの差分オペレーション
+    depth: usize,
     score: isize,
     score_diff: isize,
+    parent: usize,
+    goal: bool,
+    child: usize,   // 先頭の子供
+    prev: usize,
+    next: usize,
 }
 
-impl State {
-    fn new(list: Vec<isize>, ans: FixedBitSet, score: isize, score_diff: isize) -> Self {
-        Self { list, ans, score, score_diff }
-    }
-
-    fn default(e: &Env) -> Self {
-        let mut ans = FixedBitSet::with_capacity(e.t);
-        ans.clear();
-        Self::new(vec![0; N], ans, 0, N as isize)
-    }
-
-    fn neighbors(&self, e: &Env, t: usize) -> Vec<Self> {
-        let mut res = Vec::new();
-        let score_diff_org = self.score_diff - e.pqr[t]
-            .iter().filter(|&&x| self.list[x] == 0).count() as isize;
-        for d in [1, -1] {
-            let mut list = self.list.clone();
-            e.pqr[t].iter().for_each(|&x| list[x] += d);
-            let score_diff = score_diff_org + e.pqr[t]
-                .iter().filter(|&&x| list[x] == 0).count() as isize;
-            let score = self.score + score_diff;
-            let mut ans = self.ans.clone();
-            if d == 1 { ans.insert(t); }
-            res.push(State::new(list, ans, score, score_diff));
-        }
-        res
-    }
+impl Node {
+    fn new(op: Op) -> Self { Self {
+        op, parent: !0, child: !0, prev: !0, next: !0, score_diff: N as isize, ..Self::default()
+    } }
 }
 
-mod heapmap {
-    #![allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+struct Op(isize);    // 1: 操作A, -1: 操作B
 
-    use std::collections::BinaryHeap;
-    use rustc_hash::FxHashMap as HashMap;
-    use std::cmp::Reverse;
-
-    #[derive(Debug, Clone)]
-    pub struct HeapMap<K: Ord, V> {
-        pq: PriorityQueue<K>,
-        map: HashMap<usize, V>,
-        counter: usize,
-    }
-
-    impl<K: Ord, V> HeapMap<K, V> {
-        pub fn new(priority_min: bool) -> Self {
-            Self { pq: PriorityQueue::new(priority_min), map: HashMap::default(), counter: 0, }
-        }
-        pub fn len(&self) -> usize { self.pq.len() }
-        pub fn is_empty(&self) -> bool { self.pq.is_empty() }
-        pub fn push(&mut self, (key, value): (K, V)) {
-            self.pq.push((key, self.counter));
-            self.map.insert(self.counter, value);
-            self.counter += 1;  // unsafe
-        }
-        pub fn pop(&mut self) -> Option<(K, V)> {
-            let (key, counter) = self.pq.pop()?;
-            let value = self.map.remove(&counter)?;
-            Some((key, value))
-        }
-    }
-
-    #[derive(Debug, Clone)]
-    enum PriorityQueue<K> {
-        Max(BinaryHeap<(K, usize)>),
-        Min(BinaryHeap<(Reverse<K>, usize)>),
-    }
-
-    impl<K: Ord> PriorityQueue<K> {
-        fn new(priority_min: bool) -> Self {
-            if priority_min { Self::Min(BinaryHeap::new()) } else { Self::Max(BinaryHeap::new()) }
-        }
-        fn len(&self) -> usize {
-            match self {
-                Self::Max(pq) => pq.len(),
-                Self::Min(pq) => pq.len(),
-            }
-        }
-        fn is_empty(&self) -> bool {
-            match self {
-                Self::Max(pq) => pq.is_empty(),
-                Self::Min(pq) => pq.is_empty(),
-            }
-        }
-        fn push(&mut self, (key, counter): (K, usize)) {
-            match self {
-                Self::Max(pq) => pq.push((key, counter)),
-                Self::Min(pq) => pq.push((Reverse(key), counter)),
-            }
-        }
-        fn pop(&mut self) -> Option<(K, usize)> {
-            match self {
-                Self::Max(pq) => pq.pop(),
-                Self::Min(pq) => pq.pop().map(|(Reverse(key), counter)| (key, counter)),
-            }
-        }
+impl std::fmt::Display for Op {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", if self.0 == 1 { "A" } else { "B" })
     }
 }
