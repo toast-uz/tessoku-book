@@ -1,8 +1,0 @@
-testcases/
-tools/
-Cargo.lock
-.vscode/
-eval.py
-setup.py
-rust-toolchain
-vis.html
