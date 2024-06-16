@@ -2,7 +2,7 @@ use std::time::Instant;
 use std::cmp::Reverse;
 use proconio::input;
 use proconio::marker::Usize1;
-use itertools::Itertools;
+use itertools::{iproduct, Itertools};
 use rustc_hash::FxHashSet as HashSet;
 use xorshift_rand::*;
 
@@ -40,6 +40,7 @@ struct Env {
     root_state: State,
     seed: Vec<u64>,
     pqr: Vec<Vec<usize>>,
+    pred_max_score: Vec<Vec<Vec<isize>>>,
 }
 
 impl Env {
@@ -59,6 +60,29 @@ impl Env {
         self.root_state = State::new();
         // 乱数シードの設定
         self.seed = (0..N).map(|_| rng.gen_u64()).collect();
+        // 各要素の最大予想スコアの事前計算
+        self.pred_max_score = vec![vec![vec![0; T]; N]; T];
+        for i in 0..N {
+            let mut pqr: HashSet<usize> = HashSet::default();
+            for t in 0..T {
+                if self.pqr[t][0] == i || self.pqr[t][1] == i || self.pqr[t][2] == i { pqr.insert(t); }
+            }
+            let mut todo = vec![(T - 1, 0, 0), (T - 1, 1, 0)];
+            while let Some((t, val, mut score)) = todo.pop() {
+                if t < T - 1 {
+                    self.pred_max_score[t][i][val] = self.pred_max_score[t][i][val].max(score);
+                }
+                if t == 0 { continue; }
+                if val == 0 { score += 1; }
+                if pqr.contains(&t) {
+                    if val == 1 { todo.push((t - 1, val - 1, score)); }
+                    todo.push((t - 1, val + 1, score));
+                } else {
+                    todo.push((t - 1, val, score));
+                }
+            }
+        }
+        iproduct!(0..T, 0..N).for_each(|(t, i)| { self.pred_max_score[t][i][0] = (T - t) as isize; });
         // ハイパーパラメータの設定
     }
 }
@@ -102,22 +126,23 @@ impl Agent {
                     (MAX_DEPTH - depth) as f64 / elapsed).sqrt()) as usize)
                     .clamp(BEAM_WIDTH_MIN, BEAM_WIDTH_MAX);
             }
-
+            // ビームサーチ
             let (mut cands, parent_ids) = self.emum_cands(e, depth);
             self.counter += cands.len();
-            if cands.len() > width * 2 {
+            if cands.len() > width * 2 {    // 余分な候補を最初に削ると速いらしい
                 cands.select_nth_unstable_by_key(width * 2, |cand| Reverse(cand.score));
             }
             cands.sort_unstable_by_key(|cand| Reverse(cand.score));
-            for cand in cands.into_iter()
-                    .unique_by(|cand| cand.hash)
-                    .take(width) {
+            let mut hash = HashSet::default();
+            for cand in cands {
+                if hash.contains(&cand.hash) { continue; }  // unique_by より速い
+                hash.insert(cand.hash);
                 self.push_child(cand);
+                if hash.len() >= width { break; }
             }
-            for &node_id in &parent_ids {
-                self.remove_recursive(node_id);
-            }
-            dbg!("#{} counter={}, width={} memory={} (valid:{} tested:{})", depth, self.counter, width, self.nodes.len(), self.nodes.len() - self.free_nodes.len(), parent_ids.len());
+            // 不要なノードを削除
+            for &node_id in &parent_ids { self.remove_recursive(node_id); }
+            dbg!("#{} counter={}, width={} memory={} (valid:{})", depth, self.counter, width, self.nodes.len(), self.nodes.len() - self.free_nodes.len());
         }
         self.best_node_id = self.compute_best_node_id();
     }
@@ -167,7 +192,6 @@ impl Agent {
                 state.apply(e, parent_depth, &self.nodes[node_id].op);
             } else {
                 if node_id == 0 { break; }   // ルートノードに戻っていたら終了
-                assert_ne!(self.nodes[node_id].parent, !0, "parent_id = !0, node = {} {:?} {}", node_id, self.nodes[node_id], self.free_nodes.contains(&node_id));
                 let parent_depth = self.parent_depth(node_id);
                 state.revert(e, parent_depth, &self.nodes[node_id].op); // ステートをもとに戻す
                 if self.nodes[node_id].next != !0 {
@@ -182,18 +206,23 @@ impl Agent {
         }
         (cands, parent_ids)
     }
+    // 現在のノードから次のノード候補を列挙する
     fn enum_cands_from_node(&self, e: &Env, node_id: usize, state: &State) -> Vec<Cand> {
         let mut res = Vec::new();
         let node = &self.nodes[node_id];
         let pqr = &e.pqr[node.depth];
         let score_diff_old = (0..M).filter(|&i| state.elms[pqr[i]] == 0).count() as isize;
+        let score_predict = (0..N).filter(|&i| !pqr.contains(&i))
+            .map(|i| e.pred_max_score[node.depth][i][state.elms[i].abs() as usize] as isize).sum::<isize>();
         for op in [Op(1), Op(-1)].iter() {
             let mut cand = Cand {
                 op: op.clone(), depth: node.depth + 1, score: node.score, parent: node_id, ..Cand::default()
             };
             let score_diff_new = (0..M).filter(|&i| state.elms[pqr[i]] + op.0 == 0).count() as isize;
             cand.score_diff = node.score_diff + score_diff_new - score_diff_old;
-            cand.score = node.score + cand.score_diff;
+            cand.score_acc = node.score_acc + cand.score_diff;
+            cand.score = cand.score_acc + (score_predict
+                + pqr.iter().map(|&i| e.pred_max_score[node.depth][i][(state.elms[i] + op.0).abs() as usize] as isize).sum::<isize>()) / 10;
             cand.goal = if cand.depth == T { true } else { false };
             cand.hash = state.hash.wrapping_add(state.compute_hash_diff(e, node.depth, op));
             res.push(cand);
@@ -282,8 +311,9 @@ impl State {
 struct Cand {
     op: Op,  // 親からの差分オペレーション
     depth: usize,
-    score_diff: isize,
     score: isize,
+    score_diff: isize,
+    score_acc: isize,
     parent: usize,
     hash: u64,
     goal: bool,
@@ -291,7 +321,7 @@ struct Cand {
 impl Cand {
     fn to_node(&self) -> Node { Node {
         op: self.op.clone(), depth: self.depth, goal: self.goal,
-        score: self.score, score_diff: self.score_diff,
+        score: self.score, score_acc: self.score_acc, score_diff: self.score_diff,
         parent: self.parent, child: !0, prev: !0, next: !0,
     } }
 }
@@ -302,6 +332,7 @@ struct Node {
     depth: usize,
     score: isize,
     score_diff: isize,
+    score_acc: isize,
     parent: usize,
     goal: bool,
     child: usize,   // 先頭の子供
@@ -311,7 +342,8 @@ struct Node {
 
 impl Node {
     fn new(op: Op) -> Self { Self {
-        op, parent: !0, child: !0, prev: !0, next: !0, score_diff: N as isize, ..Self::default()
+        op, parent: !0, child: !0, prev: !0, next: !0,
+        score_diff: N as isize, ..Self::default()
     } }
 }
 
